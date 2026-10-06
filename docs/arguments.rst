@@ -183,6 +183,60 @@ a string as ``content_type`` argument to :meth:`Blueprint.arguments
    view function but it should not be called with more that one request body
    location. This limitation is discussed in :issue:`46`.
 
+Structured Validation Errors
+----------------------------
+
+By default, a validation error produces an ``errors`` field containing the
+nested messages dictionary built by marshmallow/webargs. Its keys may be
+internal Python field names (for errors raised from schema-level validators)
+or marshmallow internal markers such as ``_schema``, which makes them hard to
+map back to the client request.
+
+Setting ``ERROR_STRUCTURED_PATHS = True`` in the application configuration adds
+an ``error_details`` field to the error response. It is a flat list of entries,
+each describing one error with the location and the field path using the names
+the client actually sent (marshmallow ``data_key`` values):
+
+.. code-block:: python
+
+    {
+        "code": 422,
+        "status": "UNPROCESSABLE_ENTITY",
+        "errors": {"json": {"user_id": ["Not a valid integer."]}},
+        "error_details": [
+            {
+                "location": "body",
+                "field_path": ["userId"],
+                "kind": "field",
+                "messages": ["Not a valid integer."],
+            }
+        ],
+    }
+
+Each entry contains:
+
+- ``location``: the request part the parameter belongs to: ``"body"``,
+  ``"query"``, ``"header"``, ``"form"``, ``"cookie"``, ``"files"`` or
+  ``"path"``. The same schema used in several ``arguments`` decorators produces
+  paths with the correct location.
+- ``field_path``: list of path components from the request root. Field names
+  are the client-facing ``data_key`` values. List items are represented by
+  their zero-based index (``["items", 1, "displayName"]``) and dictionary
+  values by their key (``["meta", "color"]``). The marshmallow internal
+  ``"key"``/``"value"`` markers never appear in the path.
+- ``kind``: ``"field"`` for an invalid field value, ``"missing"`` for a
+  required field that was not provided, ``"unknown"`` for a field the schema
+  does not accept and ``"object"`` for a whole-object (schema-level)
+  validation failure. Whole-object errors are not attached to a fabricated
+  field: ``field_path`` ends at the offending object and is empty for the
+  request body itself.
+- ``messages``: the original, unmodified validation messages.
+
+The original text messages are always preserved in ``errors`` and
+``error_details``. The raw offending input value is never returned by default;
+set ``ERROR_INCLUDE_INPUT = True`` to additionally add an ``input`` field to
+each entry (missing fields always report ``null``).
+
 File Upload
 -----------
 

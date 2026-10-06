@@ -4,6 +4,17 @@ Changelog
 0.48.0 (unreleased)
 *******************
 
+Features:
+
+- Add structured validation error paths. When ``ERROR_STRUCTURED_PATHS`` is
+  enabled, validation error responses include an ``error_details`` list where
+  each entry provides the request location (``body``, ``query``, ``header``...),
+  the client-facing field path built from marshmallow ``data_key`` values
+  (through ``Nested``, lists and dictionaries), the error kind (``field``,
+  ``missing``, ``unknown`` or ``object``) and the original messages.
+  ``ERROR_INCLUDE_INPUT`` may be enabled to also include the offending input
+  value.
+
 Other changes:
 
 - Officially support Python 3.14 (:pr:`857`).
