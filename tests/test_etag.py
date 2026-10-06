@@ -5,14 +5,22 @@ import json
 
 import pytest
 
+import marshmallow as ma
+
 from flask import Response, jsonify
 from flask import request as f_request
 from flask.views import MethodView
 
 from flask_smorest import Api, Blueprint, abort
-from flask_smorest.etag import _get_etag_ctx
+from flask_smorest.etag import (
+    _etag_matches_if_match,
+    _etag_matches_if_none_match,
+    _get_etag_ctx,
+    _parse_etag_header,
+)
 from flask_smorest.exceptions import (
     CurrentApiNotAvailableError,
+    FlaskSmorestError,
     NotModified,
     PreconditionFailed,
     PreconditionRequired,
@@ -714,3 +722,323 @@ class TestEtag:
         response = client.get("/test/")
         assert response.json == {}
         assert response.get_etag() == (blp._generate_etag("waow"), False)
+
+
+class TestEtagHeaderParsing:
+    """Test If-Match / If-None-Match header parsing and comparison rules"""
+
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        (
+            (None, ([], False)),
+            ("", ([], False)),
+            ('"abc"', ([(False, "abc")], False)),
+            ('W/"abc"', ([(True, "abc")], False)),
+            ("abc", ([(False, "abc")], False)),
+            (
+                '"abc", W/"def", "ghi"',
+                ([(False, "abc"), (True, "def"), (False, "ghi")], False),
+            ),
+            ("*", ([], True)),
+            ('"abc", *', ([(False, "abc")], True)),
+        ),
+    )
+    def test_parse_etag_header(self, header, expected):
+        assert _parse_etag_header(header) == expected
+
+    @pytest.mark.parametrize(
+        ("header", "matches"),
+        (
+            # Weak comparison: weak and strong tags match, "*" matches
+            ('"abc"', True),
+            ('W/"abc"', True),
+            ('"other", "abc"', True),
+            ('W/"other", "abc"', True),
+            ("*", True),
+            ('"other"', False),
+            ('W/"other"', False),
+            (None, False),
+        ),
+    )
+    def test_etag_matches_if_none_match(self, header, matches):
+        assert _etag_matches_if_none_match("abc", header) is matches
+
+    @pytest.mark.parametrize(
+        ("header", "matches"),
+        (
+            # Strong comparison: weak tags never match, "*" matches
+            ('"abc"', True),
+            ('W/"abc"', False),
+            ('"other", "abc"', True),
+            ('W/"other", W/"abc"', False),
+            ("*", True),
+            ('"other"', False),
+            (None, False),
+        ),
+    )
+    def test_etag_matches_if_match(self, header, matches):
+        assert _etag_matches_if_match("abc", header) is matches
+
+
+@pytest.fixture
+def app_with_etag_representation(app, collection, schemas):
+    """Return an API sample using representation ETag mode"""
+
+    app.config["ETAG_MODE"] = "representation"
+    DocSchema = schemas.DocSchema
+
+    class DocReducedSchema(ma.Schema):
+        """Same data as DocSchema but serialized differently"""
+
+        item_id = ma.fields.Int(dump_only=True)
+
+    blp = Blueprint("test", __name__, url_prefix="/test")
+    pagination_header = {"value": '{"total": 2}'}
+
+    def _get_item(item_id):
+        try:
+            return collection.get_by_id(item_id)
+        except ItemNotFound:
+            abort(404)
+
+    @blp.route("/<int:item_id>")
+    @blp.etag
+    @blp.response(200, DocSchema)
+    def get_resource(item_id):
+        return _get_item(item_id)
+
+    @blp.route("/reduced/<int:item_id>")
+    @blp.etag
+    @blp.response(200, DocReducedSchema)
+    def get_resource_reduced(item_id):
+        return _get_item(item_id)
+
+    @blp.route("/<int:item_id>", methods=("PUT",))
+    @blp.etag
+    @blp.arguments(DocSchema)
+    @blp.response(200, DocSchema)
+    def put_resource(new_item, item_id):
+        item = _get_item(item_id)
+        blp.check_etag(item, DocSchema)
+        return collection.put(item_id, new_item)
+
+    @blp.route("/vary/<int:item_id>")
+    @blp.etag
+    @blp.response(200, DocSchema)
+    def get_resource_vary(item_id):
+        return _get_item(item_id), {"Vary": "Accept"}
+
+    @blp.route("/paginated")
+    @blp.etag
+    @blp.response(200, DocSchema(many=True))
+    def get_resources_paginated():
+        return collection.items, {"X-Pagination": pagination_header["value"]}
+
+    @blp.route("/stream")
+    @blp.etag
+    @blp.response(200)
+    def get_stream():
+        def generate():
+            yield b"chunk"
+
+        return Response(generate(), mimetype="application/json")
+
+    api = Api(app)
+    api.register_blueprint(blp)
+
+    app.pagination_header = pagination_header
+
+    return app
+
+
+class TestEtagRepresentationMode:
+    """Test ETag computed from the final response representation"""
+
+    @staticmethod
+    def _sha1(data):
+        return hashlib.sha1(data).hexdigest()
+
+    def test_etag_from_response_bytes(self, app_with_etag_representation, collection):
+        """ETag is a strong tag computed from actual response bytes"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/1")
+        assert response.status_code == 200
+        etag, is_weak = response.get_etag()
+        assert not is_weak
+        assert etag == self._sha1(response.get_data())
+
+    def test_etag_changes_with_schema(
+        self, app_with_etag_representation, collection
+    ):
+        """Same business object, different schemas: different ETags"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/1")
+        reduced_response = client.get("/test/reduced/1")
+        assert response.json != reduced_response.json
+        etag, _ = response.get_etag()
+        reduced_etag, _ = reduced_response.get_etag()
+        assert etag != reduced_etag
+        # Each tag matches the hash of its own representation bytes
+        assert etag == self._sha1(response.get_data())
+        assert reduced_etag == self._sha1(reduced_response.get_data())
+
+    def test_etag_changes_with_pagination_metadata(
+        self, app_with_etag_representation, collection
+    ):
+        """Pagination metadata is part of the representation"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/paginated")
+        etag_1 = response.headers["ETag"]
+        # Same data, different pagination metadata
+        app_with_etag_representation.pagination_header["value"] = '{"total": 3}'
+        response = client.get("/test/paginated")
+        etag_2 = response.headers["ETag"]
+        assert etag_1 != etag_2
+
+    def test_if_none_match(self, app_with_etag_representation, collection):
+        """If-None-Match uses weak comparison and supports lists and '*'
+
+        Conditional request statuses are consistent with returned bytes.
+        """
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/1")
+        etag = response.headers["ETag"]
+
+        # Exact tag, weak tag, tag list and "*" all match
+        for header in (etag, f"W/{etag}", f'"other", {etag}', "*"):
+            response = client.get("/test/1", headers={"If-None-Match": header})
+            assert response.status_code == 304
+            # 304 responses have no body but keep the ETag header
+            assert response.get_data() == b""
+            assert response.headers["ETag"] == etag
+
+        # Other tag does not match
+        response = client.get("/test/1", headers={"If-None-Match": '"other"'})
+        assert response.status_code == 200
+
+        # Bytes changed: old tag does not match anymore
+        collection.put(1, {"db_field": 1})
+        response = client.get("/test/1", headers={"If-None-Match": etag})
+        assert response.status_code == 200
+        assert response.headers["ETag"] != etag
+        assert response.headers["ETag"] == f'"{self._sha1(response.get_data())}"'
+
+    def test_if_match(self, app_with_etag_representation, collection):
+        """If-Match uses strong comparison and supports lists and '*'"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/1")
+        etag = response.headers["ETag"]
+        item_data = {"field": 1}
+
+        # Missing If-Match: Precondition Required
+        response = client.put(
+            "/test/1", data=json.dumps(item_data), content_type="application/json"
+        )
+        assert response.status_code == 428
+
+        # Weak tag never matches
+        response = client.put(
+            "/test/1",
+            data=json.dumps(item_data),
+            content_type="application/json",
+            headers={"If-Match": f"W/{etag}"},
+        )
+        assert response.status_code == 412
+
+        # Wrong tag does not match
+        response = client.put(
+            "/test/1",
+            data=json.dumps(item_data),
+            content_type="application/json",
+            headers={"If-Match": '"other"'},
+        )
+        assert response.status_code == 412
+
+        # Exact tag, tag list and "*" match
+        for make_header in (
+            lambda e: e,
+            lambda e: f'"other", {e}',
+            lambda e: "*",
+        ):
+            response = client.put(
+                "/test/1",
+                data=json.dumps(item_data),
+                content_type="application/json",
+                headers={"If-Match": make_header(etag)},
+            )
+            assert response.status_code == 200
+            # Response ETag is computed from the new representation
+            etag = response.headers["ETag"]
+            assert etag == f'"{self._sha1(response.get_data())}"'
+
+    def test_head(self, app_with_etag_representation, collection):
+        """HEAD responses have no body but keep ETag and Vary headers"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/vary/1")
+        etag = response.headers["ETag"]
+
+        head_response = client.head("/test/vary/1")
+        assert head_response.status_code == 200
+        assert head_response.get_data() == b""
+        assert head_response.headers["ETag"] == etag
+        assert head_response.headers["Vary"] == "Accept"
+
+        head_response = client.head(
+            "/test/vary/1", headers={"If-None-Match": etag}
+        )
+        assert head_response.status_code == 304
+        assert head_response.get_data() == b""
+        assert head_response.headers["ETag"] == etag
+        assert head_response.headers["Vary"] == "Accept"
+
+    def test_not_modified_keeps_headers(
+        self, app_with_etag_representation, collection
+    ):
+        """304 responses have no body but keep ETag and Vary headers"""
+        collection.post({"db_field": 0})
+        client = app_with_etag_representation.test_client()
+
+        response = client.get("/test/vary/1")
+        etag = response.headers["ETag"]
+
+        response = client.get("/test/vary/1", headers={"If-None-Match": etag})
+        assert response.status_code == 304
+        assert response.get_data() == b""
+        assert response.headers["ETag"] == etag
+        assert response.headers["Vary"] == "Accept"
+
+    def test_streamed_response_rejected(
+        self, app_with_etag_representation
+    ):
+        """Non-replayable streamed responses are explicitly rejected"""
+        client = app_with_etag_representation.test_client()
+        with pytest.raises(FlaskSmorestError, match="streamed"):
+            client.get("/test/stream")
+
+    def test_invalid_etag_mode(self, app, collection, schemas):
+        """An invalid ETAG_MODE is rejected"""
+        app.config["ETAG_MODE"] = "invalid"
+        api = Api(app)
+        blp = Blueprint("test", __name__, url_prefix="/test")
+
+        @blp.route("/")
+        @blp.etag
+        @blp.response(200, schemas.DocSchema(many=True))
+        def get_resources():
+            return collection.items
+
+        api.register_blueprint(blp)
+        with pytest.raises(FlaskSmorestError, match="ETAG_MODE"):
+            app.test_client().get("/test/")

@@ -4,6 +4,17 @@ Changelog
 0.48.0 (unreleased)
 *******************
 
+Features:
+
+- Add ``ETAG_MODE`` application parameter. When set to ``"representation"``,
+  the ETag is a strong validator computed from the actual response
+  representation bytes (and representation metadata such as pagination
+  headers) rather than from the underlying data. Conditional request
+  handling distinguishes ``If-None-Match`` (weak comparison) from
+  ``If-Match`` (strong comparison) and supports weak tags, tag lists and
+  ``*``. ``HEAD`` and ``304`` responses carry the ``ETag`` and ``Vary``
+  headers. Streamed responses are rejected in this mode.
+
 Other changes:
 
 - Officially support Python 3.14 (:pr:`857`).

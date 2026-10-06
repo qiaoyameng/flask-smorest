@@ -149,3 +149,40 @@ up to the developer to decide whether this data should be part of the ETag.
 
 By default, only pagination header is included in the ETag computation. This
 can be changed by customizing `Blueprint.ETAG_INCLUDE_HEADERS`.
+
+ETag Computed from the Response Representation
+----------------------------------------------
+
+In the default `"data"` mode, the ETag is computed from data structures: the
+data dumped by the :class:`Schema <marshmallow.Schema>`, or arbitrary data
+passed to :meth:`set_etag <Blueprint.set_etag>`. Two representations may then
+share the same ETag even though the client sees different bytes, for instance
+when the schema, the response format or pagination metadata change.
+
+Setting the `ETAG_MODE` application parameter to `"representation"` enables an
+explicit mode where the ETag is a strong validator computed from the final
+response representation: the actual serialized response body bytes, plus the
+representation metadata listed in `Blueprint.ETAG_INCLUDE_HEADERS` (pagination
+headers, by default).
+
+.. code-block:: python
+
+    app.config["ETAG_MODE"] = "representation"
+
+In this mode,
+
+- the ETag of a response is computed from the response bytes, so any change
+  to the schema output, the response format or the pagination metadata
+  produces a different ETag, even for identical underlying data;
+- :meth:`set_etag <Blueprint.set_etag>` and
+  :meth:`check_etag <Blueprint.check_etag>` also hash the JSON serialization
+  of their data, so a schema should be passed to serialize business objects
+  the same way the response does;
+- `If-None-Match` is evaluated with the weak comparison rule (weak `W/`
+  prefixes are ignored) while `If-Match` is evaluated with the strong
+  comparison rule (weak tags never match); both support tag lists and `"*"`;
+- `HEAD` and `304` responses don't carry a body but keep the `ETag` and
+  `Vary` headers;
+- non-replayable streamed responses are not supported and are explicitly
+  rejected: compute the ETag manually with
+  :meth:`set_etag <Blueprint.set_etag>` for those.
