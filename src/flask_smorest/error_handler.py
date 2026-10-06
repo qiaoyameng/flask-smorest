@@ -4,6 +4,9 @@ from werkzeug.exceptions import HTTPException
 
 import marshmallow as ma
 
+from .etag import _get_etag_ctx
+from .exceptions import NotModified
+
 
 class ErrorSchema(ma.Schema):
     """Schema describing the error payload
@@ -55,6 +58,17 @@ class ErrorHandlerMixin:
         """
         headers = {}
         payload = {"code": error.code, "status": error.name}
+
+        # A 304 response has no body, but it must still carry the ETag of the
+        # representation that would have been returned (and the Vary header
+        # that selects it). Both were stashed in the ETag context before
+        # NotModified was raised.
+        if isinstance(error, NotModified):
+            etag_ctx = _get_etag_ctx()
+            if etag_ctx.get("etag"):
+                headers["ETag"] = f'"{etag_ctx["etag"]}"'
+            if etag_ctx.get("vary"):
+                headers["Vary"] = ", ".join(etag_ctx["vary"])
 
         # Get additional info passed as kwargs when calling abort
         # data may not exist if HTTPException was raised without webargs abort

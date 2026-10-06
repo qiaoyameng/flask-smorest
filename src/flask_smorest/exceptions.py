@@ -32,5 +32,16 @@ class PreconditionFailed(wexc.PreconditionFailed, FlaskSmorestError):
     """Etag required and wrong ETag provided"""
 
 
+class RepresentationNotReplayableError(FlaskSmorestError):
+    """Representation ETag cannot be computed from a non-replayable response
+
+    Raised when a representation-based strong ETag is requested on a response
+    whose body cannot be buffered and hashed (a streaming or direct
+    passthrough response). Such a response is not replayable: reading the
+    body to compute the ETag would consume it, so the ETag must be provided
+    manually with :meth:`Blueprint.set_etag <Blueprint.set_etag>`.
+    """
+
+
 class CurrentApiNotAvailableError(FlaskSmorestError):
     """`current_api` not available"""

@@ -4,6 +4,7 @@ import hashlib
 import json
 
 import pytest
+import marshmallow as ma
 
 from flask import Response, jsonify
 from flask import request as f_request
@@ -16,6 +17,7 @@ from flask_smorest.exceptions import (
     NotModified,
     PreconditionFailed,
     PreconditionRequired,
+    RepresentationNotReplayableError,
 )
 from flask_smorest.utils import get_appcontext
 
@@ -368,6 +370,91 @@ class TestEtag:
             blp._set_etag_in_response(resp)
             assert resp.get_etag() == (etag, False)
 
+    def test_if_none_match_comparison_rules(self, app):
+        """If-None-Match uses weak comparison (also in legacy mode)"""
+        api = Api(app)
+        blp = Blueprint("test", __name__, url_prefix="/test")
+        client = app.test_client()
+
+        @blp.route("/")
+        @blp.etag
+        @blp.response(200)
+        def get_resource():
+            return {}
+
+        api.register_blueprint(blp)
+        etag = client.get("/test/").headers["ETag"]
+        raw = etag.strip('"')
+
+        assert (
+            client.get("/test/", headers={"If-None-Match": etag}).status_code
+            == 304
+        )
+        # Weak validator: weak comparison matches
+        assert (
+            client.get(
+                "/test/", headers={"If-None-Match": f'W/"{raw}"'}
+            ).status_code
+            == 304
+        )
+        # Star
+        assert (
+            client.get("/test/", headers={"If-None-Match": "*"}).status_code
+            == 304
+        )
+        # List containing the matching tag
+        assert (
+            client.get(
+                "/test/",
+                headers={"If-None-Match": f'"nope", "{raw}"'},
+            ).status_code
+            == 304
+        )
+        # No match: 200 with a body
+        mismatch = client.get("/test/", headers={"If-None-Match": '"nope"'})
+        assert mismatch.status_code == 200
+        assert mismatch.data
+
+    def test_304_response_keeps_etag_header(self, app):
+        """304 has no body but still carries the representation ETag"""
+        api = Api(app)
+        blp = Blueprint("test", __name__, url_prefix="/test")
+        client = app.test_client()
+
+        @blp.route("/")
+        @blp.etag
+        @blp.response(200)
+        def get_resource():
+            return {}
+
+        api.register_blueprint(blp)
+        etag = client.get("/test/").headers["ETag"]
+        response = client.get("/test/", headers={"If-None-Match": etag})
+        assert response.status_code == 304
+        assert response.data == b""
+        assert response.headers["ETag"] == etag
+
+    def test_if_match_ignores_weak_validators(self, app):
+        """If-Match uses strong comparison: a weak validator never matches"""
+        blp = Blueprint("test", __name__, url_prefix="/test")
+
+        with app.test_request_context(
+            "/test/", method="PUT", headers={"If-Match": 'W/"tag"'}
+        ):
+            assert not blp._if_match_matches(f_request.if_match, "tag")
+        with app.test_request_context(
+            "/test/", method="PUT", headers={"If-Match": '"tag"'}
+        ):
+            assert blp._if_match_matches(f_request.if_match, "tag")
+        with app.test_request_context(
+            "/test/", method="PUT", headers={"If-Match": "*"}
+        ):
+            assert blp._if_match_matches(f_request.if_match, "tag")
+        with app.test_request_context(
+            "/test/", method="PUT", headers={"If-Match": '"other"'}
+        ):
+            assert not blp._if_match_matches(f_request.if_match, "tag")
+
     def test_etag_duplicate_header(self, app):
         """Check duplicate header results in a different ETag"""
 
@@ -714,3 +801,322 @@ class TestEtag:
         response = client.get("/test/")
         assert response.json == {}
         assert response.get_etag() == (blp._generate_etag("waow"), False)
+
+
+class TestRepresentationEtag:
+    """Test strong ETag computed from the final response representation"""
+
+    ITEM = {"item_id": 1, "db_field": 7}
+
+    @pytest.fixture
+    def rep_app(self, app):
+        app.config["ETAG_REPRESENTATION_BASED"] = True
+        api = Api(app)
+        blp = Blueprint("test", __name__, url_prefix="/test")
+
+        class FullSchema(ma.Schema):
+            item_id = ma.fields.Int()
+            field = ma.fields.Int(attribute="db_field")
+
+        class BriefSchema(ma.Schema):
+            item_id = ma.fields.Int()
+
+        @blp.route("/full")
+        @blp.etag
+        @blp.response(200, FullSchema)
+        def full():
+            return self.ITEM
+
+        @blp.route("/brief")
+        @blp.etag
+        @blp.response(200, BriefSchema)
+        def brief():
+            return self.ITEM
+
+        @blp.route("/full", methods=["PUT"])
+        @blp.etag
+        @blp.arguments(FullSchema)
+        @blp.response(200, FullSchema)
+        def put_full(new_item):
+            blp.check_etag(self.ITEM, FullSchema)
+            return self.ITEM
+
+        @blp.route("/stream")
+        @blp.etag
+        @blp.response(200)
+        def stream():
+            return Response(
+                iter([b'{"a": 1}']), mimetype="application/json"
+            )
+
+        @blp.route("/stream-manual")
+        @blp.etag
+        @blp.response(200)
+        def stream_manual():
+            blp.set_etag(FullSchema().dump(self.ITEM))
+            return Response(
+                iter([b'{"a": 1}']), mimetype="application/json"
+            )
+
+        api.register_blueprint(blp)
+        return app, blp, FullSchema, BriefSchema
+
+    @staticmethod
+    def _hash_representation(body, content_type, header_items=()):
+        def feed(hash_obj, raw):
+            hash_obj.update(str(len(raw)).encode("ascii"))
+            hash_obj.update(b":")
+            hash_obj.update(raw)
+
+        etag_hash = hashlib.sha1()
+        feed(etag_hash, body)
+        feed(etag_hash, content_type.encode("utf-8"))
+        for name, value in header_items:
+            feed(etag_hash, name.encode("utf-8"))
+            feed(etag_hash, value.encode("utf-8"))
+        return etag_hash.hexdigest()
+
+    def test_etag_is_hash_of_real_serialized_bytes(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        response = client.get("/test/full")
+        # The actual wire bytes (real JSON, trailing newline included)
+        assert response.data == b'{"field":7,"item_id":1}\n'
+        expected = self._hash_representation(
+            response.data, response.headers["Content-Type"]
+        )
+        # Strong validator: quoted, not prefixed with W/
+        assert response.headers["ETag"] == f'"{expected}"'
+        assert response.headers["Vary"] == "Accept"
+
+    def test_etag_changes_with_schema_representation(self, rep_app):
+        """Same business object, different schema output => different ETag"""
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        full = client.get("/test/full")
+        brief = client.get("/test/brief")
+        # Same source object, different serialized representations
+        assert full.data != brief.data
+        assert full.headers["ETag"] != brief.headers["ETag"]
+
+    def test_etag_changes_with_content_type(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        full = client.get("/test/full")
+
+        # The representation metadata (Content-Type) participates in the
+        # hash: same body with another Content-Type yields another ETag.
+        other_content_type_etag = (
+            '"'
+            + self._hash_representation(
+                full.data, "application/xml"
+            )
+            + '"'
+        )
+        assert other_content_type_etag != full.headers["ETag"]
+        assert full.headers["ETag"] == (
+            '"'
+            + self._hash_representation(
+                full.data, full.headers["Content-Type"]
+            )
+            + '"'
+        )
+
+    def test_if_none_match_strong_tag_returns_304(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        etag = client.get("/test/full").headers["ETag"]
+        response = client.get("/test/full", headers={"If-None-Match": etag})
+        assert response.status_code == 304
+        assert response.data == b""
+        assert response.headers["ETag"] == etag
+        assert response.headers["Vary"] == "Accept"
+
+    @pytest.mark.parametrize(
+        "header_value",
+        [
+            'W/"{etag}"',  # weak validator: weak comparison matches
+            "*",  # star matches any existing representation
+            '"nope", "{etag}"',  # list containing the matching tag
+            'W/"nope", W/"{etag}"',  # list with weak matching tag
+        ],
+    )
+    def test_if_none_match_weak_comparison(self, rep_app, header_value):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        etag = client.get("/test/full").headers["ETag"].strip('"')
+        response = client.get(
+            "/test/full",
+            headers={"If-None-Match": header_value.format(etag=etag)},
+        )
+        assert response.status_code == 304
+        # ETag/Vary preserved even without a body
+        assert response.headers["ETag"] == f'"{etag}"'
+        assert response.headers["Vary"] == "Accept"
+
+    def test_if_none_match_mismatch_returns_full_body(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        original = client.get("/test/full")
+        response = client.get(
+            "/test/full", headers={"If-None-Match": '"other"'}
+        )
+        assert response.status_code == 200
+        # Conditional miss returns exactly the same bytes as an unconditional
+        # request.
+        assert response.data == original.data
+        assert response.headers["ETag"] == original.headers["ETag"]
+
+    def test_head_has_no_body_but_keeps_etag_and_vary(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        get_response = client.get("/test/full")
+        head_response = client.head("/test/full")
+        assert head_response.status_code == 200
+        assert head_response.data == b""
+        assert head_response.headers["ETag"] == get_response.headers["ETag"]
+        assert head_response.headers["Vary"] == "Accept"
+        # HEAD-computed tag validates the same representation as GET
+        cond_get = client.get(
+            "/test/full",
+            headers={"If-None-Match": head_response.headers["ETag"]},
+        )
+        assert cond_get.status_code == 304
+
+    def test_if_match_strong_comparison_rules(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        etag = client.get("/test/full").headers["ETag"]
+        payload = json.dumps({"item_id": 1, "field": 7})
+        kwargs = {"data": payload, "content_type": "application/json"}
+
+        # Strong tag matches
+        assert (
+            client.put("/test/full", headers={"If-Match": etag}, **kwargs).status_code
+            == 200
+        )
+        # Weak validator never satisfies If-Match (strong comparison)
+        weak = "W/" + etag
+        assert (
+            client.put("/test/full", headers={"If-Match": weak}, **kwargs).status_code
+            == 412
+        )
+        # Star matches an existing representation
+        assert (
+            client.put("/test/full", headers={"If-Match": "*"}, **kwargs).status_code
+            == 200
+        )
+        # List with the matching strong tag
+        assert (
+            client.put(
+                "/test/full",
+                headers={"If-Match": f'"nope", {etag}'},
+                **kwargs,
+            ).status_code
+            == 200
+        )
+        # List with only a weak version does not match
+        assert (
+            client.put(
+                "/test/full",
+                headers={"If-Match": f'"nope", W/{etag}'},
+                **kwargs,
+            ).status_code
+            == 412
+        )
+        # List without the tag does not match
+        assert (
+            client.put(
+                "/test/full", headers={"If-Match": '"nope"'}, **kwargs
+            ).status_code
+            == 412
+        )
+        # Missing precondition
+        assert client.put("/test/full", **kwargs).status_code == 428
+
+    def test_check_etag_tag_matches_response_tag(self, rep_app):
+        """check_etag must compare against the final representation tag"""
+        app, _, FullSchema, _ = rep_app
+        client = app.test_client()
+        etag = client.get("/test/full").headers["ETag"]
+        # A PUT with the representation tag passes check_etag
+        response = client.put(
+            "/test/full",
+            data=json.dumps({"item_id": 1, "field": 7}),
+            content_type="application/json",
+            headers={"If-Match": etag},
+        )
+        assert response.status_code == 200
+
+    def test_pagination_metadata_participates_in_etag(self, app, schemas):
+        """X-Pagination metadata is part of the representation ETag"""
+        app.config["ETAG_REPRESENTATION_BASED"] = True
+        api = Api(app)
+        blp = Blueprint("test", __name__, url_prefix="/test")
+        items = [
+            {"item_id": 1, "db_field": 0},
+            {"item_id": 2, "db_field": 1},
+        ]
+
+        @blp.route("/")
+        @blp.etag
+        @blp.response(200, schemas.DocSchema(many=True))
+        @blp.paginate(page=1, page_size=1)
+        def get_resources(pagination_parameters):
+            pagination_parameters.item_count = len(items)
+            return items[
+                pagination_parameters.first_item : pagination_parameters.last_item
+                + 1
+            ]
+
+        api.register_blueprint(blp)
+        client = app.test_client()
+
+        page_1 = client.get("/test/")
+        page_2 = client.get("/test/?page=2")
+        # The bodies differ, of course
+        assert page_1.data != page_2.data
+        # Pagination metadata differs and is part of the ETag: recompute the
+        # ETag of page 2's body *with page 1's pagination header* and check
+        # it neither equals the real page 1 nor page 2 ETag.
+        assert page_1.headers["ETag"] != page_2.headers["ETag"]
+        assert page_1.headers["X-Pagination"]
+        assert page_2.headers["X-Pagination"]
+        assert (
+            page_1.headers["X-Pagination"] != page_2.headers["X-Pagination"]
+        )
+        # 304 on page 1 preserves the ETag
+        conditional = client.get(
+            "/test/", headers={"If-None-Match": page_1.headers["ETag"]}
+        )
+        assert conditional.status_code == 304
+        assert conditional.headers["ETag"] == page_1.headers["ETag"]
+        # Page 2's tag must not validate page 1
+        cross = client.get(
+            "/test/", headers={"If-None-Match": page_2.headers["ETag"]}
+        )
+        assert cross.status_code == 200
+        assert cross.data == page_1.data
+
+    def test_streaming_response_is_rejected(self, rep_app):
+        app, _, _, _ = rep_app
+        client = app.test_client()
+        with pytest.raises(RepresentationNotReplayableError):
+            client.get("/test/stream")
+
+    def test_streaming_response_allowed_with_manual_etag(self, rep_app):
+        app, blp, FullSchema, _ = rep_app
+        client = app.test_client()
+        response = client.get("/test/stream-manual")
+        assert response.status_code == 200
+        # Body streamed through without buffering/hashing
+        assert response.data == b'{"a": 1}'
+        # Manual tag: hash of the jsonify bytes of the dumped payload
+        with app.test_request_context():
+            json_response = app.json.response(FullSchema().dump(self.ITEM))
+            expected = blp._hash_representation(
+                json_response.get_data(),
+                json_response.headers["Content-Type"],
+            )
+        assert response.headers["ETag"] == f'"{expected}"'
+        assert response.headers["Vary"] == "Accept"

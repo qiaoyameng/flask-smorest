@@ -149,3 +149,60 @@ up to the developer to decide whether this data should be part of the ETag.
 
 By default, only pagination header is included in the ETag computation. This
 can be changed by customizing `Blueprint.ETAG_INCLUDE_HEADERS`.
+
+Strong ETag Computed from the Final Response Representation
+-----------------------------------------------------------
+
+The computation above hashes the dumped Python structure. As a consequence,
+it does not change when only the output schema, the response envelope, the
+serialization format or the pagination metadata changes, even though the
+representation actually sent to the client is different. It is therefore a
+weak coupling with the response bytes.
+
+Set `ETAG_REPRESENTATION_BASED` to ``True`` to compute a *strong* ETag from
+the final response representation instead:
+
+- the exact bytes serialized on the wire (after schema dumping and JSON
+  serialization, including separators and the trailing newline) are hashed;
+- the representation metadata participates in the hash: the
+  ``Content-Type`` header and the headers listed in
+  `Blueprint.ETAG_REPRESENTATION_HEADERS` (``X-Pagination`` by default);
+- every piece hashed is length-framed, so header values cannot be confused
+  with body bytes. The Python ``dict`` ``repr`` is never used.
+
+With this setting, the same business object serialized through two different
+schemas produces two different ETags, as expected.
+
+`Content Negotiation`_: because the ``Content-Type`` is part of the
+representation, a ``Vary: Accept`` header is automatically added to the
+responses.
+
+Conditional requests follow RFC 9110 comparison rules:
+
+- ``If-None-Match`` uses *weak* comparison. A weak validator
+  (``W/"..."``), a strong validator, an entry in a list or ``*`` all match
+  the current representation and produce a ``304``.
+- ``If-Match`` uses *strong* comparison. A weak validator never matches;
+  only a strong validator (or ``*``, when the representation exists) passes.
+
+In this mode, `Blueprint.check_etag` and `Blueprint.set_etag` hash the data
+the same way ``jsonify`` serializes it, so the tag passed in ``If-Match``
+matches the ETag later returned on the response.
+
+On a ``304`` response or a ``HEAD`` request, no body is sent, but the
+``ETag`` and ``Vary`` headers corresponding to the representation that would
+have been returned are preserved.
+
+Streaming Responses
+~~~~~~~~~~~~~~~~~~~
+
+A representation-based ETag cannot be computed on a non-replayable
+streaming response (a response built from a generator, a file object or with
+``direct_passthrough`` enabled, such as the response returned by
+:func:`flask.send_file`): reading the body to hash it would consume the
+stream. Such an endpoint raises a
+``RepresentationNotReplayableError``. It must call
+`Blueprint.set_etag` explicitly to provide a strong ETag computed from
+another stable source.
+
+.. _Content Negotiation: https://developer.mozilla.org/en-US/docs/Web/HTTP/Content_negotiation
