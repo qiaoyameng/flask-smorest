@@ -131,6 +131,46 @@ mapping disables the feature for all locations.
    documentation
    <https://webargs.readthedocs.io/en/latest/advanced.html#setting-unknown>`_.
 
+Validation Error Paths
+----------------------
+
+When argument validation fails, the error response contains the text error
+messages in the ``errors`` attribute. It also contains a structured
+``error_paths`` list allowing the client to locate each error in the request
+it sent. Each entry provides:
+
+- ``location``: the parameter location (``query``, ``body``, ``header``,
+  ``cookie`` or ``path``)
+- ``path``: the field path as seen by the client, using ``data_key`` names
+  and integer indexes for list items
+- ``messages``: the text error messages
+- ``type``: ``missing`` (required field missing), ``unknown`` (unknown
+  field), ``schema`` (whole-object error, e.g. from a schema-level
+  validator) or ``validation`` (any other field validation error)
+
+.. code-block:: json
+
+    {
+        "code": 422,
+        "status": "Unprocessable Entity",
+        "errors": {"json": {"items": {1: {"name": ["Not a valid string."]}}}},
+        "error_paths": [
+            {
+                "location": "body",
+                "path": ["items", 1, "name"],
+                "messages": ["Not a valid string."],
+                "type": "validation"
+            }
+        ]
+    }
+
+Whole-object errors (schema-level validators) point to the object itself: no
+field is added to the path. Raw input values are not included in the
+response. Set ``VALIDATION_ERROR_PATHS_INCLUDE_VALUE`` application parameter
+to ``True`` to add the offending input ``value`` to each entry, and
+``VALIDATION_ERROR_PATHS`` to ``False`` to disable the ``error_paths``
+attribute altogether.
+
 Multiple Arguments Schemas
 --------------------------
 

@@ -4,6 +4,17 @@ Changelog
 0.48.0 (unreleased)
 *******************
 
+Features:
+
+- Add structured ``error_paths`` to validation error responses. Each entry
+  provides the parameter location (``query``, ``body``, ``header``,
+  ``cookie`` or ``path``), the client-facing field path (using ``data_key``
+  names and list indexes), the original text messages and an error type
+  (``missing``, ``unknown``, ``schema`` or ``validation``). Can be disabled
+  with ``VALIDATION_ERROR_PATHS`` application parameter. Raw input values
+  are not included unless ``VALIDATION_ERROR_PATHS_INCLUDE_VALUE``
+  application parameter is set.
+
 Other changes:
 
 - Officially support Python 3.14 (:pr:`857`).

@@ -4,6 +4,8 @@ from werkzeug.exceptions import HTTPException
 
 import marshmallow as ma
 
+from .error_paths import build_error_paths
+
 
 class ErrorSchema(ma.Schema):
     """Schema describing the error payload
@@ -15,6 +17,10 @@ class ErrorSchema(ma.Schema):
     status = ma.fields.String(metadata={"description": "Error name"})
     message = ma.fields.String(metadata={"description": "Error message"})
     errors = ma.fields.Dict(metadata={"description": "Errors"})
+    error_paths = ma.fields.List(
+        ma.fields.Dict,
+        metadata={"description": "Structured validation error paths"},
+    )
 
 
 class ErrorHandlerMixin:
@@ -52,6 +58,18 @@ class ErrorHandlerMixin:
         - `errors` (``dict``): errors, typically validation errors in
             parameters and request body
         - `headers` (``dict``): additional headers
+
+        When the error was raised while validating request arguments, a
+        structured ``error_paths`` list is added to the payload, unless
+        ``VALIDATION_ERROR_PATHS`` application parameter is set to
+        ``False``. Each entry provides the parameter ``location``
+        (``query``, ``body``, ``header``, ``cookie`` or ``path``), the
+        client-facing field ``path`` (using ``data_key`` names and list
+        indexes), the original text ``messages`` and an error ``type``
+        (``missing``, ``unknown``, ``schema`` or ``validation``). Raw input
+        values are not included unless
+        ``VALIDATION_ERROR_PATHS_INCLUDE_VALUE`` application parameter is
+        set to ``True``.
         """
         headers = {}
         payload = {"code": error.code, "status": error.name}
@@ -73,5 +91,18 @@ class ErrorHandlerMixin:
             # If we passed additional headers
             if "headers" in data:
                 headers = data["headers"]
+            # If a validation error was raised while parsing arguments,
+            # add structured error paths
+            exc = getattr(error, "exc", None)
+            if isinstance(exc, ma.ValidationError) and self.config.get(
+                "VALIDATION_ERROR_PATHS", True
+            ):
+                payload["error_paths"] = build_error_paths(
+                    exc,
+                    schema=data.get("schema"),
+                    include_value=self.config.get(
+                        "VALIDATION_ERROR_PATHS_INCLUDE_VALUE", False
+                    ),
+                )
 
         return payload, error.code, headers
